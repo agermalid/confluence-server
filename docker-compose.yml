@@ -1,0 +1,169 @@
+version: "3.9"
+
+services:
+
+  traefik:
+    hostname: traefik
+    image: traefik:${TRAEFIK_VERSION:?err}
+    container_name: traefik
+    ports: # HOST:CONTAINER
+      - "80:80"     # The HTTP port
+      - "443:443"   # The HTTPS port
+      - "8081:8081" # The Web UI (enabled by --api)
+    networks:
+      frontend_net:
+      backend_net:
+        ipv4_address: 172.16.239.2
+    restart: unless-stopped
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro" 
+      - "./configs/certs:/etc/traefik/certs:ro"
+      - "./configs/traefik/configs/traefik.yaml:/etc/traefik/traefik.yaml"
+      - "./configs/traefik/configfiles:/etc/traefik/configfiles"
+    healthcheck:
+      test: 
+        - CMD
+        - traefik
+        - healthcheck
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik-dashboard.entrypoints=https"
+      - "traefik.http.routers.traefik-dashboard.rule=Host(`${STAND_HOSTNAME:?err}`) && (PathPrefix(`/api`) || PathPrefix(`/traefik`))"
+      - "traefik.http.routers.traefik-dashboard.service=api@internal"
+      - "traefik.http.routers.traefik-dashboard.tls=true"      
+     # traefik middlewares
+      - "traefik.http.routers.traefik-dashboard.middlewares=traefik_auth,traefik_strip,trafik_compress"
+      - "traefik.http.middlewares.traefik_auth.basicauth.users=${TRAEFIK_AUTH_DATA:?err}"
+      - "traefik.http.middlewares.traefik_strip.stripprefix.prefixes=/traefik"
+      # # middlewares
+      - "traefik.http.middlewares.dafault_middlewares.chain.middlewares=trafik_compress,trafik_ratelimit,trafik_retry,slash_step1,slash_step2,http_header"
+      # trafik_compress
+      - "traefik.http.middlewares.trafik_compress.compress=true"
+      ## trafik_ratelimit
+      - "traefik.http.middlewares.trafik_ratelimit.ratelimit.average=100"
+      - "traefik.http.middlewares.trafik_ratelimit.ratelimit.burst=10"
+      ## trafik_retry
+      - "traefik.http.middlewares.trafik_retry.retry.attempts=5"
+      ## slash_step1 + slash_step2 | Add missing trailing slash
+      - "traefik.http.middlewares.slash_step1.redirectregex.regex=^(https?://[^/]+/[a-z0-9_]+)$$"
+      - "traefik.http.middlewares.slash_step1.redirectregex.replacement=$${1}/"
+      - "traefik.http.middlewares.slash_step1.redirectregex.permanent=true"
+      - "traefik.http.middlewares.slash_step2.stripprefixregex.regex=/[a-z0-9_]+"
+      ## header_all
+      - "traefik.http.middlewares.http_header.headers.browserXssFilter=true"
+      - "traefik.http.middlewares.http_header.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.http_header.headers.forceSTSHeader=true"
+      - "traefik.http.middlewares.http_header.headers.framedeny=true"
+      - "traefik.http.middlewares.http_header.headers.sslredirect=true"
+      - "traefik.http.middlewares.http_header.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.http_header.headers.stsPreload=true"
+      - "traefik.http.middlewares.http_header.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.http_header.headers.featurePolicy=accelerometer 'none'; ambient-light-sensor 'none'; camera 'none'; geolocation 'none'; gyroscope 'none'; magnetometer 'none'; microphone 'none'; usb 'none'; midi 'none'; sync-xhr 'none'; vr 'none'"
+      - "traefik.http.middlewares.http_header.headers.contentSecurityPolicy=default-src https:"
+      - "traefik.http.middlewares.http_header.headers.referrerPolicy=strict-origin-when-cross-origin"
+
+  confluence-server:
+    image: atlassian/confluence-server:${CONFLUENCE_SOFTWARE_VERSION:?err}
+    container_name: confluence-server
+    networks:
+      frontend_net:
+        ipv4_address: 172.16.238.46
+    ports:
+      - "8090:8090"
+      - "8091:8091"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    depends_on:
+      traefik: { condition: service_started }
+    environment:
+      - JVM_MAXIMUM_MEMORY=6144m
+      - JVM_MINIMUM_MEMORY=2048m
+      - JVM_RESERVED_CODE_CACHE_SIZE=2048m
+      - CATALINA_CONNECTOR_PROXYNAME=${STAND_HOSTNAME}
+      - CATALINA_CONNECTOR_PROXYPORT=443
+      - CATALINA_CONNECTOR_SCHEME=https
+    volumes:
+      - "confluence_server_data:/var/atlassian/application-data/confluence"
+      - "/etc/localtime:/etc/localtime:ro"
+      - "./configs/certs:/certs:ro"      
+      - "./configs/confluence-server/integrate-ssl-crt-to-confluence-server.sh:/integrate-ssl-crt-to-confluence-server.sh"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.confluence-software.entrypoints=https"
+      - "traefik.http.routers.confluence-software.rule=Host(`${STAND_HOSTNAME:?err}`)"
+      - "traefik.http.routers.confluence-software.tls=true"      
+      - "traefik.http.services.confluence-software.loadbalancer.server.port=8090"
+
+  postgresql-server:
+    image: postgres:${POSTGRES_VERSION:?err}
+    container_name: postgresql-server
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?err}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?err}
+    networks:
+      frontend_net:
+        aliases:
+          - db
+    volumes:
+      - "/etc/localtime:/etc/localtime:ro"
+      - "postgresql_data:/var/lib/postgresql/data:rw"
+      - "./configs/postgresql/12.11-bullseye/postgresql.conf:/etc/postgresql/postgresql.conf"
+      - "./configs/postgresql/scripts/init-database.sh:/docker-entrypoint-initdb.d/init-database.sh"
+    restart: unless-stopped
+    depends_on:
+      traefik: { condition: service_started }
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:?err}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    labels: 
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.postgresql-server.entrypoints=db"
+      - "traefik.tcp.routers.postgresql-server.rule=HostSNI(`*`)"
+      - "traefik.tcp.routers.postgresql-server.service=postgresql-server"
+      - "traefik.tcp.services.postgresql-server.loadbalancer.server.port=5432"
+
+  portainer:
+    image: portainer/portainer-ce:${PORTAINER_VERSION:?err}
+    container_name: portainer
+    command: "-H unix:///var/run/docker.sock --admin-password ${PORTAINER_ADMIN_ENCRYPT_PASSWORD:?err}"
+    networks:
+      frontend_net:
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "portainer_data:/data"
+    restart: unless-stopped
+    depends_on:
+      traefik: { condition: service_started }
+    labels:
+    - "traefik.enable=true"
+    - "traefik.http.routers.portainer.entrypoints=https"
+    - "traefik.http.routers.portainer.rule=Host(`${STAND_HOSTNAME:?err}`) && PathPrefix(`/portainer/`)"
+    - "traefik.http.routers.portainer.tls=true"
+    - "traefik.http.services.portainer.loadbalancer.server.port=9000"
+    - "traefik.http.middlewares.portainer_stripprefix.stripprefix.prefixes=/portainer/"
+    - "traefik.http.routers.portainer.middlewares=portainer_stripprefix,trafik_compress,slash_step1"
+
+volumes:
+  postgresql_data:
+  pgadmin_data:
+  portainer_data:
+  confluence_server_data:
+
+networks:
+  frontend_net:
+    external:
+      name: frontend_net
+  backend_net:
+    external:
+      name: backend_net
